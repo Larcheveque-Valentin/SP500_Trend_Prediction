@@ -11,6 +11,7 @@ Hyper Parameter Search for Functionnal Convolution
 """
 
 # Import modules
+
 import inspect
 import gc
 import random
@@ -57,10 +58,16 @@ from statistics import stdev
 # import torch
 # import torch.nn as nn
 # import torch.nn.functional as F
-
+import copy
 import skfda
 from skfda import FDataGrid as fd
 from skfda.representation.basis import BSpline as B
+
+def row_column_scaler(X):
+    for i in range(X.shape[0]):
+        for j in range(X.shape[2]):
+            X[i,:,j]=(X[i,:,j]-torch.mean(X[i,:,j]))/torch.var(X[i,:,j])
+    return X
 
 
 def weights_init_normal(m):
@@ -71,9 +78,9 @@ def weights_init_normal(m):
         torch.nn.init.normal_(m.weight.data, 1.0, std=0.005)
         torch.nn.init.constant_(m.bias.data, 0.0)
 
-def from_torch_to_Datagrid(x):
+def from_torch_to_Datagrid(x,namethod='bfill'):
     if isinstance(x,torch.Tensor):
-        x_grid=fd(data_matrix=x[:,0,:].cpu(),grid_points=np.arange(x.shape[2]+1)[1:])
+        x_grid=fd(data_matrix=x[:,0,:].cpu(),grid_points=np.arange(x.shape[2]+1)[1:]).fillna(method=namethod)
     elif isinstance(x,skfda.representation.grid.FDataGrid):
         x_grid=x
     else:
@@ -87,110 +94,65 @@ def conv_block_out(kernel_size,stride,padding,dilation,n):
     return ((n+2*padding-dilation*(kernel_size-1)-1)//stride)+1
 
 
+def rm_tensor(tensor, indices):
+    mask = torch.ones_like(tensor[:,0,0]).bool()
+    mask[indices] = False
+    return tensor[mask,:,:]
+
+def market_loss(y_hat,y_test,hours_train=1,total_basis=B(knots=linspace(0,1,9),order=4),eval_points=linspace(0,1,500)):
+    hours_train=hours_train
+    eval_points=linspace(1,252,500)
 
 
-        
-
-
-class Smoothing_method:
-    def __init__(self,knots_or_basis="knots",Mode="Smooth",basis_type="Bspline",order=3,t0=1,T=12,period=2*pi,n_basis=13,n_knots=6):
-        self.Mode=Mode
-        self.basis_type=basis_type
-        # self.interpolation_order=interpolation_order
-        self.order=order
-        self.knots_or_basis=knots_or_basis
-
-        self.knots=np.linspace(t0,T,n_knots)
-        self.n_knots=n_knots
-        self.period=period
-        self.n_basis=n_basis
-            
-    def smoothing(self):
-        if 'inter' in self.Mode:
-            # interpolation=skfda.representation.interpolation.SplineInterpolation(interpolation_order=self.interpolation_order)             
-            smooth_meth= skfda.representation.interpolation.SplineInterpolation(interpolation_order=self.order)             
-        else:
-            if "knots" in self.knots_or_basis:  
-                if ("spline" in self.basis_type) or ("Bsp" in self.basis_type) or ("spl" in self.basis_type):
-                    smooth_meth= B(knots=self.knots,order=self.order)
-                if self.basis_type=="Fourier":
-                    smooth_meth=skfda.representation.basis.FourierBasis(domain_range=[min(self.knots),max(self.knots)],period=self.period)
-            if "basis" in self.knots_or_basis:
-                if ("spline" in self.basis_type) or ("Bsp" in self.basis_type) or ("spbasis" in self.basis_type):
-                    smooth_meth= B(n_basis=self.n_basis,order=self.order)
-                if ("fourier" in self.basis_type)or ("fourrier" in self.basis_type) or ("Fourier" in self.basis_type) or ("four" in self.basis_type):
-                    smooth_meth=skfda.representation.basis.FourierBasis(n_basis=self.n_basis,period=self.period)
-        return smooth_meth
-
-def Granulator(x,granulation,channels=1,basis=B(knots=linspace(0,1,15),order=4),derivative=[0],mode="Bspline"):
-        
-        x_grid=from_torch_to_Datagrid(x=x)
-        if "inter" not in mode:     
-            Recons_train=torch.zeros([x_grid.shape[0],channels*len(derivative),granulation]).float().cuda()
-            i=0
-            for channel in range(channels):
-                for deriv in derivative:
-                    eval_points=linspace(1,x_grid.grid_points[0].shape[0],granulation)
-                    coefs_torch=torch.from_numpy(x_grid.to_basis(basis).coefficients).float().cuda()
-                    basis_eval=basis(eval_points=eval_points,derivative=deriv)
-                    basis_fc = torch.from_numpy(basis_eval).float().cuda()
-                    # coefs_torch=torch.from_numpy(coefs).float().cuda()        
-                    Recons_train[:,i,:]=torch.matmul(coefs_torch,basis_fc[:,:,channel])
-                    i+=1    
-        
-        else:
-            x_grid.interpolation=skfda.representation.interpolation.SplineInterpolation(basis.order)
-            eval_points=linspace(1,x_grid.grid_points[0].shape[0],granulation)
-            Recons_train=x_grid.interpolation._evaluate(fdata=x_grid,eval_points=eval_points)[:,:,0]
-            
-            Recons_train=torch.tensor(Recons_train).reshape(Recons_train.shape[0],channels,Recons_train.shape[1])
-        
-        return Recons_train.float().cuda()
-
-
-class TSConv1d(nn.Module):
-    def __init__(self,kernel_size,out_channels,dilation,granulation,knots=linspace(0,1,15),order=4,channels=1,derivative=[0],mode="Bspline",padding=0,stride=1,hyperparameter=None):
-            
-        super(TSConv1d,self).__init__()
-        
-        self.basis=B(knots=knots,order=order)
-        self.granulation
-        self.channels=channels
-        self.derivative=derivative
-        self.mode=mode
-        self.convlayer=nn.Sequential(nn.Conv1d(in_channels=channels,out_channels=out_channels,kernel_size=kernel_size,stride=stride,padding=padding,dilation=dilatation,bias=True,groups=1))
-                    
-    def forward(self,x):
-        Granulated_x_train=Granulator(x,self.granulation,basis=self.basis,channels=self.channels,derivative=self.derivative,mode=self.mode)
-        Conv_out=self.convlayer(Granulated_x_train)
-        return Conv_out
-
-class TSConv1d_hyperparam(nn.Module):
-    def __init__(self,hyperparameter):
-            
-        super(TSConv1d_hyperparam,self).__init__()
-        self.hyperparameter=hyperparameter
-        self.basis=hyperparameter.basis
-        self.convlayer=nn.Sequential(
-            nn.Conv1d(in_channels=hyperparameter.n_channel*len(hyperparameter.derivative),out_channels=hyperparameter.n_conv_in,kernel_size=hyperparameter.kernel_size_1,stride=hyperparameter.stride_1,padding=hyperparameter.padding_1,dilation=hyperparameter.dilation_1,bias=True,groups=1),
-            )
-
-
-
-    def forward(self,x):
-            Granulated_x_train=Granulator(x,self.hyperparameter.granulation,basis=self.hyperparameter.basis,channels=self.hyperparameter.n_channel,derivative=self.hyperparameter.derivative,mode=self.hyperparameter.Smoothing_mode)
-            Conv_out=self.convlayer(Granulated_x_train)
-            return Conv_out
-                        
-
-
-
-
+    basis_eval_ordre_0=total_basis(eval_points=eval_points,derivative=0)
+    basis_eval_ordre_1=total_basis(eval_points=eval_points,derivative=1)
+    basis_fc_ordre_1=torch.from_numpy(basis_eval_ordre_0).float().cuda()
+    basis_fc_ordre_0=torch.from_numpy(basis_eval_ordre_1).float().cuda()
+    # basis_fc_test_ordre_1=torch.from_numpy(basis_eval_ordre_0).float().cuda()
+    # basis_fc_test_ordre_0=torch.from_numpy(basis_eval_ordre_1).float().cuda()
+    recons_test_ordre_0=torch.matmul(y_hat[:,:,0,0],basis_fc_ordre_0[:,:,0])
+    recons_test_ordre_1=torch.matmul(y_hat[:,:,0,0],basis_fc_ordre_1[:,:,0])
+    recons_ordre_0=torch.matmul(y_hat[:,:,0,0],basis_fc_ordre_0[:,:,0])
+    recons_ordre_1=torch.matmul(y_hat[:,:,0,0],basis_fc_ordre_1[:,:,0])
+    recons_ordre_test_0=torch.matmul(y_test[:,:,0,0],basis_fc_ordre_0[:,:,0])
+    recons_ordre_test_1=torch.matmul(y_test[:,:,0,0],basis_fc_ordre_1[:,:,0])
+    
+    loss_entre_lissages=nn.MSELoss()(recons_ordre_0[:,hours_train-1:],
+                             recons_ordre_test_0[:,hours_train-1:])
+    # loss_reel=nn.MSELoss()(recons_ordre_0[:,hours_train-1:],
+    #                          y_test_tensor)
+    loss_entre_lissages_derive=nn.MSELoss()(recons_ordre_1[:,hours_train-1:],
+                             recons_ordre_test_1[:,hours_train-1:])
+    loss_coefs=nn.MSELoss()(y_hat,y_test)
+    
+    loss_sign_derive= nn.CrossEntropyLoss()(torch.sign(recons_ordre_1[:,hours_train-1:]),
+                                            torch.sign(recons_ordre_test_1[:,hours_train-1:]))
+    
+    # loss_weights=torch.tensor([0.2,0.2,0.2,0.2,0.2])                
+    
+    
+    
+    # loss_cat=torch.cat([
+    #     loss_sign_derive,
+    #     loss_coefs,
+    #     loss_entre_lissages_derive,
+    #     loss_entre_lissages,
+    #     # loss_reel,
+    #     ])
+    # loss_totale=torch.sqrt(torch.dot(loss_cat,loss_weights))
+    loss_totale=torch.sqrt(
+        # 0.1*loss_reel+
+        0.2*loss_entre_lissages_derive+
+        0.2*loss_entre_lissages+
+        0.2*loss_coefs+
+        0.3*loss_sign_derive
+    )
+    
+    
+    return loss_totale
 
 class HyperParameters:
-    def __init__(self,basis=skfda.representation.basis.VectorValuedBasis([Smoothing_method().smoothing()
-    ,
-    Smoothing_method().smoothing(),]),Smoothing_mode="smooth",batch_size=30, n_epochs=25, granulation=2000,
+    def __init__(self,Smoothing_mode="smooth",batch_size=30, n_epochs=25, granulation=2000,
                  n_conv_in=32, n_conv_in2=512, n_conv_in3=256,n_conv_out=64, n_Flat_out=256,
                  stride_1=1, stride_2=1, stride_3=1,
                  stride_pool_1=2, stride_pool_2=2, stride_pool_3=1,
@@ -271,10 +233,126 @@ class HyperParameters:
         self.loss = loss
         self.negative_slope=negative_slope
         self.norm_type=norm_type
-        if n_channel!=1:
-            self.basis=basis
+        self.basis=Smoothing_method(
+            n_knots=self.n_knots,
+            Mode=self.Smoothing_mode,
+            dim_dom=n_channel,
+            order=order,
+            knots_or_basis="knots",
+            basis_type="Bspline",
+            ).smoothing()
+
+
+        
+
+
+class Smoothing_method(HyperParameters):
+
+    def __init__(self,knots_or_basis="knots",Mode="Smooth",basis_type="Bspline",order=3,t0=1,T=12,period=2*pi,n_basis=13,n_knots=6,dim_dom=1,domain=[0,1]):
+        self.Mode=Mode
+        self.basis_type=basis_type
+        self.dim_dom=dim_dom
+        # self.interpolation_order=interpolation_order
+        self.order=order
+        self.knots_or_basis=knots_or_basis
+
+        self.knots=np.linspace(t0,T,n_knots)
+        self.n_knots=n_knots
+        self.domain=linspace(domain[0],domain[1],n_knots)
+        self.period=period
+        self.n_basis=n_basis
+
+    def smoothing(self):
+        if 'inter' in self.Mode:
+            # interpolation=skfda.representation.interpolation.SplineInterpolation(interpolation_order=self.interpolation_order)             
+            smooth_meth= skfda.representation.interpolation.SplineInterpolation(interpolation_order=self.order)             
         else:
-            self.basis=basis
+            if "knots" in self.knots_or_basis:  
+                if ("spline" in self.basis_type) or ("Bsp" in self.basis_type) or ("spl" in self.basis_type):
+                    basis_list=[]
+                    for i in range(self.dim_dom):
+                        smooth_meth= B(knots=self.knots,order=self.order)
+                        basis_list.append(smooth_meth)
+                    smoother=MultiBasis(basis_list)
+                if self.basis_type=="Fourier":
+                    smooth_meth=skfda.representation.basis.FourierBasis(domain_range=[min(self.knots),max(self.knots)],period=self.period)
+            if "basis" in self.knots_or_basis:
+                if ("spline" in self.basis_type) or ("Bsp" in self.basis_type) or ("spbasis" in self.basis_type):
+                    basis_list=[]
+                    for i in range(self.dim_dom):
+                        smooth_meth= B(n_basis=self.n_basis,order=self.order)
+                        basis_list.append(smooth_meth)
+                    smoother=MultiBasis(basis_list)
+                if ("fourier" in self.basis_type)or ("fourrier" in self.basis_type) or ("Fourier" in self.basis_type) or ("four" in self.basis_type):
+                    smooth_meth=skfda.representation.basis.FourierBasis(n_basis=self.n_basis,period=self.period)
+        return smoother
+
+def Granulator(x,granulation,channels=1,basis=B(knots=linspace(0,1,15),order=4),derivative=[0],mode="Bspline"):
+        
+        x_grid=from_torch_to_Datagrid(x)
+        if "inter" not in mode:     
+            Recons_train=torch.zeros([x_grid.shape[0],channels*len(derivative),granulation]).float().cuda()
+            i=0
+            for channel in range(channels):
+                for deriv in derivative:
+                    eval_points=linspace(1,x_grid.grid_points[0].shape[0],granulation)
+                    coefs_torch=torch.from_numpy(x_grid.to_basis(basis).coefficients).float().cuda()
+                    basis_eval=basis(eval_points=eval_points,derivative=deriv)
+                    basis_fc = torch.from_numpy(basis_eval).float().cuda()
+                    # coefs_torch=torch.from_numpy(coefs).float().cuda()        
+                    Recons_train[:,i,:]=torch.matmul(coefs_torch,basis_fc[:,:,channel])
+                    i+=1    
+        
+        else:
+            x_grid.interpolation=skfda.representation.interpolation.SplineInterpolation(basis.order)
+            eval_points=linspace(1,x_grid.grid_points[0].shape[0],granulation)
+            Recons_train=x_grid.interpolation._evaluate(fdata=x_grid,eval_points=eval_points)[:,:,0]
+            
+            Recons_train=torch.tensor(Recons_train).reshape(Recons_train.shape[0],channels,Recons_train.shape[1])
+        
+        return Recons_train.float().cuda()
+
+
+class TSConv1d(nn.Module):
+    def __init__(self,kernel_size,out_channels,dilation,granulation,knots=linspace(0,1,15),order=4,channels=1,derivative=[0],mode="Bspline",padding=0,stride=1,hyperparameter=None):
+            
+        super(TSConv1d,self).__init__()
+        
+        self.basis=B(knots=knots,order=order)
+        self.granulation
+        self.channels=channels
+        self.derivative=derivative
+        self.mode=mode
+        self.convlayer=nn.Sequential(nn.Conv1d(in_channels=channels,out_channels=out_channels,kernel_size=kernel_size,stride=stride,padding=padding,dilation=dilation,bias=True,groups=1))
+                    
+    def forward(self,x):
+        Granulated_x_train=Granulator(x,self.granulation,basis=self.basis,channels=self.channels,derivative=self.derivative,mode=self.mode)
+        Conv_out=self.convlayer(Granulated_x_train)
+        return Conv_out
+
+class TSConv1d_hyperparam(nn.Module):
+    def __init__(self,hyperparameter):
+            
+        super(TSConv1d_hyperparam,self).__init__()
+        self.hyperparameter=hyperparameter
+        self.basis=hyperparameter.basis
+        self.convlayer=nn.Sequential(
+            nn.Conv1d(in_channels=hyperparameter.n_channel*len(hyperparameter.derivative),out_channels=hyperparameter.n_conv_in,kernel_size=hyperparameter.kernel_size_1,stride=hyperparameter.stride_1,padding=hyperparameter.padding_1,dilation=hyperparameter.dilation_1,bias=True,groups=1),
+            )
+
+
+
+    def forward(self,x):
+            Granulated_x_train=Granulator(x,self.hyperparameter.granulation,basis=self.hyperparameter.basis,channels=self.hyperparameter.n_channel,derivative=self.hyperparameter.derivative,mode=self.hyperparameter.Smoothing_mode)
+            Conv_out=self.convlayer(Granulated_x_train)
+            return Conv_out
+                        
+
+
+
+
+
+        
 
 
 
@@ -474,10 +552,10 @@ def conv_total_out_une_couche(hyperparams=HyperParameters(),lp=False):
         n=j
     else:
         j=conv_block_out_lp(n=k,
-                        kernel_size=kernel_size_pool_1[i],
-                        stride=stride_pool_1[i],
-                        dilation=dilation_pool_1[i],
-                        padding=padding_pool_1[i],
+                        kernel_size=kernel_size_pool_1[0],
+                        stride=stride_pool_1[0],
+                        dilation=dilation_pool_1[0],
+                        padding=padding_pool_1[0],
                         )
         n=j
     return n
@@ -520,13 +598,6 @@ def conv_total_out_no_pool(hyperparams=HyperParameters()):
         n=k
 
     return n
-
-
-
-
-
-
-
 
 
 class LayerNorm(nn.Module):
@@ -1232,16 +1303,16 @@ def Compile_class(model_class="avec",hyperparams=HyperParameters(),output_size=1
                 if x_train.data_matrix.shape[2]!=1:
                     grid_T=x_train.data_matrix.shape[1]
                     t0=x_train.grid_points[0][0]
-                    basis_list=[]
-                    for channel in range(hyperparams.n_channel):
-                        basis_channel=Smoothing_method(n_knots=hyperparams.n_knots,t0=t0,T=grid_T,order=hyperparams.order,Mode=hyperparams.Smoothing_mode).smoothing()
-                        basis_list.append(basis_channel)
-                    hyperparams.basis=MultiBasis(basis_list=basis_list)
+                    hyperparams.basis=Smoothing_method(n_knots=hyperparams.n_knots,t0=t0,T=grid_T,order=hyperparams.order,Mode=hyperparams.Smoothing_mode,dim_dom=hyperparams.n_channel).smoothing()
+                    # basis_list=[]
+                    # for channel in range(hyperparams.n_channel):
+                        # basis_list.append(basis_channel)
+                    # hyperparams.basis=MultiBasis(basis_list=basis_list)
         elif isinstance(x_train,torch.Tensor):
             grid_T=x_train.shape[2]
             # t0=x_train.grid_points[0][0]
             # hyperparams.n_knots=grid_T//5
-            hyperparams.basis=Smoothing_method(n_knots=hyperparams.n_knots,order=hyperparams.order,T=grid_T,Mode=hyperparams.Smoothing_mode).smoothing()
+            hyperparams.basis=Smoothing_method(n_knots=hyperparams.n_knots,order=hyperparams.order,T=grid_T,Mode=hyperparams.Smoothing_mode,dim_dom=hyperparams.n_channel).smoothing()
 
         hyperparams.n_conv_out=conv_total_out(hyperparams=hyperparams)
         module=TSCNN(hyperparams=hyperparams,output_size=output_size)
@@ -1256,7 +1327,7 @@ def Compile_class(model_class="avec",hyperparams=HyperParameters(),output_size=1
                     for channel in range(hyperparams.n_channel):
                         basis_channel=B(knots=linspace(t0,grid_T,hyperparams.n_knots),order=hyperparams.order)
                         basis_list.append(basis_channel)
-                    hyperparams.basis=MultiBasis(basis_list=basis_list)
+                    hyperparams.basis=MultiBasis(basis_list)
         elif isinstance(x_train,torch.Tensor):
             grid_T=x_train.shape[2]
             # t0=x_train.grid_points[0][0]
@@ -1385,7 +1456,7 @@ def Compile_train(module, hyperparams,X,Y,data_amount=100000):
     def train(n_epochs, module, optimizer, loss, batch_size):
         testing_acc=torch.tensor([0])
 
-        for epoch in tqdm(range(n_epochs)):
+        for epoch in (range(n_epochs)):
             train_loss = torch.tensor(0).cuda().long()
             
             # Mélanger les données d'entraînement
@@ -1417,6 +1488,10 @@ def Compile_train(module, hyperparams,X,Y,data_amount=100000):
                 # mse_loss_train=nn.MSELoss()(module(x_train),y_train).unsqueeze(0).cpu()
                 testing_acc=torch.cat([testing_acc,mse_loss_test.cpu()],dim=0).cpu()
                 # training_acc=torch.cat([training_acc,mse_loss_train.cpu()],dim=0).cpu()
+                
+                
+
+
         return testing_acc.detach().cpu()
     
     return lambda n_epochs: train(n_epochs, module, optimizer, loss, batch_size)
@@ -1429,16 +1504,13 @@ def Hyperparameter_Test(X,Y,supra_epochs=50,alpha=0.95,model_class="smooth",hype
     # monte_carlo_train_acc=torch.zeros(hyperparameters.n_epochs+1,1)
     if len(unique(Y.cpu()))<Y.shape[0]//2:
         output_size=len(unique(Y.cpu()))
-        # hyperparameters.loss=nn.CrossEntropyLoss()
     else:
         output_size=Y.shape[1]
         hyperparameters.loss=nn.MSELoss()
-        # hyperparameters.lr=hyperparameters.lr*10
-
     for epoch in tqdm((range(supra_epochs))):
-        ##Compilation de la classe 
+##Compilation de la classe 
         Model=Compile_class(hyperparams=hyperparameters,output_size=output_size,model_class=model_class,x_train=X)
-        train_fn = Compile_train(module=Model, hyperparams=hyperparameters,X=X,Y=Y,data_amount=X.shape[0])
+        train_fn = Compile_train(module=Model, hyperparams=hyperparameters,X=X,Y=Y,data_amount=X.shape[0])        
         monte_carlo_test=train_fn(n_epochs=hyperparameters.n_epochs)
         monte_carlo_test_acc=torch.cat([monte_carlo_test_acc,monte_carlo_test.unsqueeze(1)],dim=1)
         # monte_carlo_train_acc=torch.cat([monte_carlo_train_acc,monte_carlo_train.unsqueeze(1)],dim=1)
@@ -1447,9 +1519,9 @@ def Hyperparameter_Test(X,Y,supra_epochs=50,alpha=0.95,model_class="smooth",hype
     torch.cuda.empty_cache()
     # mean_acc_train=torch.mean(monte_carlo_train_acc[1:,1:],dim=1).float()
     # var_acc_train=torch.var(monte_carlo_test_acc[1:,1:],dim=1).float()
-    
     chiffre = alpha
     quartile = norm.ppf((1 + chiffre) / 2)
+
     mean_acc_test=torch.mean(monte_carlo_test_acc[1:,1:],dim=1).float()
     var_acc_test=torch.var(monte_carlo_test_acc[1:,1:],dim=1).float()
     IC_acc_test=torch.cat([(mean_acc_test-quartile*sqrt(var_acc_test/supra_epochs)).unsqueeze(1),(mean_acc_test+quartile*sqrt(var_acc_test/supra_epochs)).unsqueeze(1)],dim=1)
@@ -1488,26 +1560,15 @@ def Hyperparameter_Test_n_data(X,Y,supra_epochs=50,alpha=0.95,model_class="smoot
             monte_carlo_test=train_fn(n_epochs=hyperparameters.n_epochs)
             monte_carlo_test_acc=torch.cat([monte_carlo_test_acc,monte_carlo_test.unsqueeze(1)],dim=1)
             # monte_carlo_train_acc=torch.cat([monte_carlo_train_acc,monte_carlo_train.unsqueeze(1)],dim=1)
-
-        
-
-        
-
         gc.collect()
         torch.cuda.empty_cache()
-
         # max_acc_train=torch.max(monte_carlo_train_acc[1:,1:],dim=0).values.float()
         max_acc_test=torch.max(monte_carlo_test_acc[1:,1:],dim=0).values.float()
         max_monte_carlo_test_acc[:,epoch]=max_acc_test
         # max_monte_carlo_train_acc[:,epoch]=max_acc_train
-    
-    
         gc.collect()
         torch.cuda.empty_cache()
-    # mean_acc_train=torch.mean(max_monte_carlo_train_acc,dim=1).float()
-    # # max_acc_train=torch.max(monte_carlo_train_acc[1:,1:],dim=1).float()
-    # var_acc_train=torch.var(max_monte_carlo_train_acc,dim=1).float()
-
+    
     
     mean_acc_test=torch.mean(max_monte_carlo_test_acc,dim=1).float()
 
@@ -1519,194 +1580,115 @@ def Hyperparameter_Test_n_data(X,Y,supra_epochs=50,alpha=0.95,model_class="smoot
 
 
 def Compare_epochs(
-            params=None,
             spec_param=None,
             datasets=None,
             models=None,
             supra_epochs=50,
             alpha=0.95,
-            colors=None,
-            label=None,
-            Conf_int=True,):
-
-    
-    
-    # fig, axes = plt.subplots(int(floor(sqrt(len(datasets)))),int(floor(sqrt(len(datasets)))), figsize=(16, 16))
-    num_datasets = len(datasets)
-    num_plots_per_row = int(sqrt(num_datasets))
-    num_plots_per_col = (num_datasets + num_plots_per_row - 1) // num_plots_per_row
-
-    # Création de la figure et des axes
-    fig, axes = plt.subplots(num_plots_per_col, num_plots_per_row, figsize=(12, 12))
-    # fig, axes = plt.subplots(((len(datasets))), figsize=(16, 16))
-    string1='Précision de '
-
-    monte_carlo_test_acc=torch.zeros(params[0].n_epochs,supra_epochs,len(datasets),len(params),len(models))
-    mean_acc_test=torch.zeros(params[0].n_epochs,len(datasets),len(params),len(models))
-    IC_acc_test=torch.zeros(params[0].n_epochs,2,len(datasets),len(params),len(models))
+            ):
+    monte_carlo_test_acc=torch.zeros(spec_param['TSC']['Phoneme'].n_epochs,supra_epochs,len(datasets),len(models))
+    mean_acc_test=torch.zeros(spec_param['TSC']['Phoneme'].n_epochs,len(datasets),len(models))
+    IC_acc_test=torch.zeros(spec_param['TSC']['Phoneme'].n_epochs,2,len(datasets),len(models))
     
     for i,dataset in enumerate((datasets)):  
         print(dataset['dataset_name'])
         name=dataset['dataset_name']  
     # Boucle pour créer chaque subplot
         X,Y=dataset['X'],dataset['Y']
-        window_left = i // num_plots_per_row
-        window_right = i % num_plots_per_row
-        ax = axes[window_left, window_right]
         X=from_torch_to_Datagrid(X)
+        for j,model in enumerate(models):
+            print(model)
+            hyperparam=spec_param[model][name]
+            if len(unique(Y.cpu()))>Y.shape[0]//2:
+                hyperparam.loss=nn.MSELoss()
+            else:
+                hyperparam.loss=nn.CrossEntropyLoss()
             
-        T=X.data_matrix.shape[1]     
-        for j,hyperparams in enumerate(params):
-            # hyperparams.batch_size=X.shape[0]
             
-           for k,model in enumerate(models):
-
-                print(model+label[k])
-                if len(unique(Y.cpu()))>Y.shape[0]//2:
-                    spec_param[model][name].loss=nn.MSELoss()
-                    # spec_param[k][i].lr=10*spec_param[k][i].lr
-                    reg=True
-                else:
-                    spec_param[model][name].loss=nn.CrossEntropyLoss()
-                    reg=False
-                spec_param[model][name].batch_size=X.shape[0]//4
-                # if i==0 :
-                #     # spec_param[k].derivatives=[0]
-                # elif i==0:
-                #     spec_param[k].n_conv_in3=128
-
-                # elif i==1:
-
-                #     spec_param[k].loss=nn.MSELoss()
-                #     spec_param[k].n_conv_in3=256
-                #     spec_param[k].derivatives=[0,1,2]
+            monte_carlo_test_acc[:,:,i,j],mean_acc_test[:,i,j],IC_acc_test[:,:,i,j]=Hyperparameter_Test(
+                model_class=model,
+                hyperparameters=hyperparam,
+                supra_epochs=supra_epochs,
+                X=X,
+                Y=Y,
+                alpha=alpha,
+            )
+    return monte_carlo_test_acc,mean_acc_test,IC_acc_test
 
 
-
-                # elif i==3:
-                #     spec_param[k].derivatives=[0,1]
-
-
-                # spec_param[k].granulation=T
-
-                
-                # spec_param[k].padding_1=T//10
-                # spec_param[k].dilation_1=((spec_param[k].granulation//(T-1))-2)
-                # spec_param[k].stride_1=((spec_param[k].granulation//(T-1)))//2
-                
-
-                
-
-                    
-
-
-                
-
-
-                
-                
-                monte_carlo_test_acc[:,:,i,j,k],mean_acc_test[:,i,j,k],IC_acc_test[:,:,i,j,k]=Hyperparameter_Test(
-                    model_class=model,
-                    hyperparameters=spec_param[model][name],
-
-                    supra_epochs=supra_epochs,
-                    X=X,
-                    Y=Y,
-                    alpha=alpha,
-                    )
-                
-                
-                # ax.plot(np.arange(hyperparams.n_epochs+1)[1:],mean_acc_test[:,i,j,k], label=string1+model+' '+"hyperparamètre"+str(j+1),color=colors[j])
-                # ax.plot(np.arange(hyperparams.n_epochs+1)[1:],IC_acc_test[:,:,i,j,k],linestyle="dashed",color=colors[j])
-                ax.plot(np.arange(hyperparams.n_epochs+1)[1:],mean_acc_test[:,i,j,k], label=string1+model+label[k],color=colors[k])
-                if Conf_int:
-                    ax.plot(np.arange(hyperparams.n_epochs+1)[1:],IC_acc_test[:,:,i,j,k],linestyle="dashed",color=colors[k])
-                # ax.plot(np.arange(hyperparams.n_epochs+1)[1:],IC_acc_test[:,:,i,j,k],linestyle="dashed",color="")
-                # ax.plot(np.arange(hyperparams.n_epochs+1)[1:],mean_acc_test[:,i,j,k], label=string1+model+' '+str(j+1)+"ème hyperparamètre")
-                ax.set_title(dataset['dataset_name'])
-                # ax.set_ylim((0,100))
-                ax.set_xlabel("epochs")
-                ax.set_ylabel("Pourcentage bien classés dans l'ensemble de test")
-                if reg:
-                    ax.legend(loc="upper right")       
-                else:
-                    ax.legend(loc="lower right")       
-
-    plt.tight_layout()  # Ajuster automatiquement les espacements entre les subplots
-    
-    plt.show()
-
-    return fig,monte_carlo_test_acc,mean_acc_test,IC_acc_test
-    # Premier dataset 
-
-# def Comp_plot(
-#         models=None,
-#         Title="Title",
-#         colors=None,
-#         label=None,
-
-# )
-
-def printer(
-            params=None,
-            spec_param=None,
-            datasets=None,
-            models=None,
-            colors=None,
-            label=None,
+def Window_Maker(
+            models=['TSC,MLP'],
+            colors=['blue','red'],
             Conf_int=True,
             mean_acc_test=None,
             IC_acc_test=None,
-            epochs=None,
-
-):
-    
-    num_datasets = len(datasets)
-    num_plots_per_row = int(sqrt(num_datasets))
-    num_plots_per_col = (num_datasets + num_plots_per_row - 1) // num_plots_per_row
-
-    # Création de la figure et des axes
-    fig, axes = plt.subplots(num_plots_per_col, num_plots_per_row, figsize=(12, 12))
-    # fig, axes = plt.subplots(((len(datasets))), figsize=(16, 16))
-    string1='Précision de '
-
-    for i,dataset in enumerate((datasets)):  
-            print(dataset['dataset_name'])  
-        # Boucle pour créer chaque subplot
-            # X,Y=dataset['X'],dataset['Y']
-            if 
-                window_left = i // num_plots_per_row
-                window_right = i % num_plots_per_row
-                ax = axes[window_left, window_right]
-                # X=from_torch_to_Datagrid(X)
-            # T=X.data_matrix.shape[1]     
-            for j,hyperparams in enumerate(params):
-                # hyperparams.batch_size=X.shape[0]
-                
-                for k,model in enumerate(models):
-
-                    print(model+label[k])
-                    # if len(unique(Y.cpu()))<Y.shape[0]//2:
-                    #     spec_param[k].loss=nn.CrossEntropyLoss()
-                    # else:
-                    #     spec_param[k].loss=nn.MSELoss()
-                    #     spec_param[k].lr=10*spec_param[k].lr
-
-                    # spec_param[k].batch_size=X.shape[0]//4
-
-                    ax.plot(np.arange(hyperparams.n_epochs+1)[1:epochs[1]-epochs[0]+1],mean_acc_test[epochs[0]:epochs[1],i,j,k], label=string1+model+label[k],color=colors[k])
-                    if Conf_int:
-                        ax.plot(np.arange(hyperparams.n_epochs+1)[1:epochs[1]-epochs[0]+1],IC_acc_test[epochs[0]:epochs[1],:,i,j,k],linestyle="dashed",color=colors[k])
-                    ax.set_title(dataset['dataset_name'])
-                    ax.set_xlabel("epochs")
-                    ax.set_ylabel("Pourcentage bien classés dans l'ensemble de test")
-                    ax.legend(loc="lower right")       
-
-    # plt.tight_layout()  # Ajuster automatiquement les espacements entre les subplots
-    
+            epochs=[0,200],
+            fig_size=(10,10),
+            title='Accuracy vs Epochs',
+            legend_attach=" accuracy",
+            x_label="Epochs",
+            y_label='Validation Accuracy',
+            fontsize_title=15,     
+            fontsize_ax=15,             
+            fontsize_legend=15, 
+            espace_entre_titre_et_graphe=12,       
+            ):
+    fig, axes = plt.subplots(figsize=fig_size)
+    for j,model in enumerate(models):
+        axes.plot(arange(start=epochs[0],stop=epochs[1])+1,mean_acc_test[epochs[0]:epochs[1],0,j], label=model+legend_attach,color=colors[j])
+        if Conf_int:
+            axes.plot(arange(start=epochs[0],stop=epochs[1])+1,IC_acc_test[epochs[0]:epochs[1],:,0,j],linestyle="dashed",color=colors[j])
+        axes.set_title(title,fontsize=fontsize_title,pad=espace_entre_titre_et_graphe)
+        axes.set_xlabel(x_label,fontsize=fontsize_ax)
+        axes.set_ylabel(y_label,fontsize=fontsize_ax)
+        axes.legend(fontsize=fontsize_legend)
+    plt.tight_layout()  # Ajuster automatiquement les espacements entre les subplots
     plt.show()
     return fig
 
+
+def Multiple_Window_Maker(
+            datasets=None,
+            models=None,
+            colors=None,
+            Conf_int=True,
+            mean_acc_test=None,
+            IC_acc_test=None,
+            epochs=[0,200],
+            titles=['Accuracy vs Epochs','Accuracy vs Epochs','Accuracy vs Epochs','Accuracy vs Epochs'],
+            legend_attach=" accuracy",
+            x_label="Epochs",
+            y_label='Validation Accuracy',
+            fig_size=(10,10),
+            fontsize_title=15,     
+            fontsize_ax=15,        
+            fontsize_legend=15,    
+            ):
+    num_datasets = len(datasets)
+    num_plots_per_row = int(sqrt(num_datasets))
+    num_plots_per_col = (num_datasets + num_plots_per_row - 1) // num_plots_per_row
+    # Création de la figure et des axes
+    fig, axes = plt.subplots(num_plots_per_col, num_plots_per_row, figsize=fig_size)
+    for i,dataset in enumerate((datasets)):    
+            name=dataset['dataset_name']  
+        # Boucle pour créer chaque subplot sauf si un seul dataset
+            if num_datasets!=1:
+                window_left = i // num_plots_per_row
+                window_right = i % num_plots_per_row
+                ax = axes[window_left, window_right]
+            else:
+                ax=axes
+            for j,model in enumerate(models):
+                ax.plot(arange(start=epochs[0],stop=epochs[1])+1,mean_acc_test[epochs[0]:epochs[1],i,j], label=model+legend_attach,color=colors[j])
+                if Conf_int:
+                    ax.plot(arange(start=epochs[0],stop=epochs[1])+1,IC_acc_test[epochs[0]:epochs[1],:,i,j],linestyle="dashed",color=colors[j])
+                ax.set_title(titles[i]+' '+ name,fontsize_title)
+                ax.set_xlabel(x_label,fontsize_ax)
+                ax.set_ylabel(y_label,fontsize_ax)
+                ax.legend(fontsize_legend)
+    plt.tight_layout()  # Ajuster automatiquement les espacements entre les subplots
+    plt.show()
+    return fig
 
 def Compare_n_datas(params=None,
             datasets=None,
@@ -1726,7 +1708,7 @@ def Compare_n_datas(params=None,
     # Création de la figure et des axes
     fig, axes = plt.subplots(num_plots_per_col, num_plots_per_row, figsize=(12, 12))
     # fig, axes = plt.subplots(((len(datasets))), figsize=(16, 16))
-    string1='Précision de '
+    legend_attach='Précision de '
 
     for i,dataset in enumerate((datasets)):   
         print(dataset['dataset_name']) 
@@ -1751,12 +1733,12 @@ def Compare_n_datas(params=None,
                     spec_param[k].lr=spec_param[k].lr*10
 
         
-                monte_carlo_test_acc=torch.zeros(n_datas,supra_epochs,len(datasets),len(params),len(models))
-                mean_acc_test=torch.zeros(n_datas,len(datasets),len(params),len(models))
-                IC_acc_test=torch.zeros(n_datas,2,len(datasets),len(params),len(models))
+                monte_carlo_test_acc=torch.zeros(n_datas,supra_epochs,len(datasets),len(models))
+                mean_acc_test=torch.zeros(n_datas,len(datasets),len(models))
+                IC_acc_test=torch.zeros(n_datas,2,len(datasets),len(models))
                 
                 
-                monte_carlo_test_acc[:,:,i,j,k],mean_acc_test[:,i,j,k],IC_acc_test[:,:,i,j,k]=Hyperparameter_Test_n_data(model_class=model,
+                monte_carlo_test_acc[:,:,i,k],mean_acc_test[:,i,k],IC_acc_test[:,:,i,k]=Hyperparameter_Test_n_data(model_class=model,
 
                     hyperparameters=spec_param[k],
                     supra_epochs=supra_epochs,
@@ -1767,12 +1749,12 @@ def Compare_n_datas(params=None,
                     )
                 
                 
-                # ax.plot(np.arange(hyperparams.n_epochs+1)[1:],mean_acc_test[:,i,j,k], label=string1+model+' '+"hyperparamètre"+str(j+1),color=colors[j])
+                # ax.plot(np.arange(hyperparams.n_epochs+1)[1:],mean_acc_test[:,i,j,k], label=legend_attach+model+' '+"hyperparamètre"+str(j+1),color=colors[j])
                 # ax.plot(np.arange(hyperparams.n_epochs+1)[1:],IC_acc_test[:,:,i,j,k],linestyle="dashed",color=colors[j])
-                ax.plot((np.arange(n_datas+1)[1:])*data_step,mean_acc_test[:,i,j,k], label=string1+model+label[j],color=colors[k])
-                ax.plot((np.arange(n_datas+1)[1:])*data_step,IC_acc_test[:,:,i,j,k],linestyle="dashed",color=colors[k])
+                ax.plot((np.arange(n_datas+1)[1:])*data_step,mean_acc_test[:,i,k], label=legend_attach+model,color=colors[k])
+                ax.plot((np.arange(n_datas+1)[1:])*data_step,IC_acc_test[:,:,i,k],linestyle="dashed",color=colors[k])
                 # ax.plot(np.arange(hyperparams.n_epochs+1)[1:],IC_acc_test[:,:,i,j,k],linestyle="dashed",color="")
-                # ax.plot(np.arange(hyperparams.n_epochs+1)[1:],mean_acc_test[:,i,j,k], label=string1+model+' '+str(j+1)+"ème hyperparamètre")
+                # ax.plot(np.arange(hyperparams.n_epochs+1)[1:],mean_acc_test[:,i,j,k], label=legend_attach+model+' '+str(j+1)+"ème hyperparamètre")
                 ax.set_title(dataset['dataset_name'])
                 ax.set_xlabel("Nombre de données d'entrainement ")
                 ax.set_ylabel("Accuracy test max atteinte")
@@ -1792,45 +1774,59 @@ def Compare_n_datas(params=None,
 
 
 
-def Hyper_parameter_GridSearch(hyperparams,parameter, grid,model_class,x,y,supra_epochs=50):
-    Final_acc = torch.tensor([0])
-    norm=torch.zeros(len(grid))
-    Optimum_parameter = grid[0]
+def Hyper_parameter_GridSearch(
+        hyperparams,
+        parameter,
+        grid,
+        model_class,
+        data_dict,
+        supra_epochs=50,
+        reg=1,
+        acc_init=torch.tensor([0]),
+          ):
+    Final_acc=acc_init
+    x=data_dict['X']
+    y=data_dict['Y']
+    # norm=torch.zeros(len(grid))
+    Optimum_parameter = copy.deepcopy(hyperparams)
     if len(unique(y.cpu()))<y.shape[0]//2:
         output_size=len(unique(y.cpu()))
-        
-        # hyperparams.loss=nn.CrossEntropyLoss()
+        hyperparams.loss=nn.CrossEntropyLoss()
     else:
         output_size=y.shape[1]
         hyperparams.loss=nn.MSELoss()
-        
-    
-    
     # Obtenir l'attribut correspondant au paramètre spécifié
     attribute = getattr(hyperparams, parameter)
     
-    for i,value in enumerate(grid):
+    for value in (grid):
         # Modifier la valeur de l'attribut de la classe HyperParameters
-        setattr(hyperparams, parameter, value)
+        setattr(Optimum_parameter, parameter, value)
         print(parameter,"=",value)
         # Utiliser l'instance de HyperParameters pour effectuer les tests
-        monte_carlo_test_acc,monte_carlo_train_acc,mean_acc_train,var_acc_train,IC_acc_train, mean_acc_test,var_acc_test,IC_acc_test = Hyperparameter_Test(supra_epochs=supra_epochs,hyperparameters=hyperparams,model_class=model_class,X=x,Y=y)
-        if torch.norm(monte_carlo_test_acc)>torch.norm(Final_acc.float()):
+        monte_carlo_test_acc, mean_acc_test,IC_acc_test = Hyperparameter_Test(supra_epochs=supra_epochs,hyperparameters=Optimum_parameter,model_class=model_class,X=x,Y=y)
+        # print("accuracy moyenne avant",torch.mean(Final_acc))
+        # print("accuracy moyenne après",torch.mean(mean_acc_test))
+        # print(reg*torch.mean(mean_acc_test)>reg*torch.mean(Final_acc.float()))
+        if reg*torch.mean(mean_acc_test)>reg*torch.mean(Final_acc.float()):
+            setattr(hyperparams, parameter, value)
             Final_acc=mean_acc_test
-            hyperparams.parameter=value
     
     return hyperparams,Final_acc
 
 
-def Hyperparameter_Search(hyperparams, grids, parameters,model_class,x,y,supra_epochs=25):
-
+def Hyperparameter_Search(
+            hyperparams,
+            grids,
+            parameters,
+            model_class,
+            data_dict,
+            supra_epochs=25,
+            acc_init=torch.tensor([0]),
+            ):
+    Final_acc=acc_init
     best_parameters = hyperparams
-    best_accuracy = 0.0
-    mean_acc_base=0.0
-    var_acc=0.0
-    
     # Boucle sur les paramètres
-    for param in tqdm(parameters):
+    for param in (parameters):
         # Vérifier si le paramètre est dans la grille
         if param in grids:
             grid_values = grids[param]  # Récupérer les valeurs de la grille pour le paramètre donné
@@ -1839,12 +1835,19 @@ def Hyperparameter_Search(hyperparams, grids, parameters,model_class,x,y,supra_e
             for value in grid_values:
                 # Mettre à jour les hyperparamètres avec la valeur actuelle du paramètre
                 setattr(best_parameters, param, value)
-
+                print(param,"=",value)
                 # Appeler la fonction de Grid Search avec les paramètres spécifiés
-                Opt_params,Final_acc = Hyper_parameter_GridSearch(best_parameters,grid=grid_values,parameter=param,model_class=model_class,x=x,y=y,supra_epochs=supra_epochs)
+                Opt_params,Final_acc = Hyper_parameter_GridSearch(
+                    best_parameters,
+                    grid=grid_values,
+                    parameter=param,
+                    model_class=model_class,
+                    data_dict=data_dict,
+                    supra_epochs=supra_epochs,
+                    acc_init=Final_acc)
                 
                 # Mettre à jour le meilleur résultat si nécessaire
-                
+                best_parameters=copy.deepcopy(Opt_params)
                     
     return Opt_params,Final_acc
 
